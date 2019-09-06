@@ -4,7 +4,10 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <wmcodecdsp.h>
 #include <propsys.h>
+#include <uuids.h>
+#include <dmo.h>
 
 #ifdef __MINGW32__
 

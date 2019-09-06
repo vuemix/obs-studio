@@ -2,12 +2,14 @@ project(mac-capture)
 
 find_library(COREAUDIO CoreAudio)
 find_library(AUDIOUNIT AudioUnit)
+find_library(AUDIOTOOLBOX AudioToolbox)
 find_library(COREFOUNDATION CoreFoundation)
 find_library(IOSURF IOSurface)
 find_library(COCOA Cocoa)
 
 include_directories(${COREAUDIO}
                     ${AUDIOUNIT}
+                    ${AUDIOTOOLBOX}
                     ${COREFOUNDATION}
 		    ${IOSURF}
 		    ${COCOA})
@@ -36,6 +38,7 @@ target_link_libraries(mac-capture
 	libobs
 	${COREAUDIO}
 	${AUDIOUNIT}
+	${AUDIOTOOLBOX}
 	${COREFOUNDATION}
 	${IOSURF}
 	${COCOA})

@@ -1,6 +1,7 @@
 #include <AudioUnit/AudioUnit.h>
 #include <CoreFoundation/CFString.h>
 #include <CoreAudio/CoreAudio.h>
+#include <AudioToolbox/AudioServices.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -53,6 +54,10 @@ struct coreaudio_data {
 	unsigned long       retry_time;
 
 	obs_source_t        *source;
+
+	OSType              auSubType;
+	Float32             volume;
+	bool                disableAEC;
 };
 
 static bool get_default_output_device(struct coreaudio_data *ca)
@@ -225,7 +230,25 @@ static bool coreaudio_init_format(struct coreaudio_data *ca)
 	/* Certain types of devices have no limit on channel count, and
 	 * there's no way to know the actual number of channels it's using,
 	 * so if we encounter this situation just force to what is defined in output */
-	if (desc.mChannelsPerFrame > 8) {
+	if (desc.mChannelsPerFrame > 8 || ca->auSubType == kAudioUnitSubType_VoiceProcessingIO) {
+		if (ca->auSubType == kAudioUnitSubType_VoiceProcessingIO) {
+			// Force the stream format to MONO for VPIO. If VPIO is unhappy, the
+			// AudioUnitRender() calls (which retrieve captured data) inside
+			// input_callback would fail (with error code such as -50)
+			channels = 1;
+
+			/* A known acceptable format:
+			  mSampleRate = 44100
+			  mFormatID = 1819304813 // lpcm
+			  mFormatFlags = 41 // kAudioFormatFlagsAudioUnitCanonical (planar float 32)
+			  mBytesPerPacket = 4
+			  mFramesPerPacket = 1
+			  mBytesPerFrame = 4
+			  mChannelsPerFrame = 1 // mono
+			  mBitsPerChannel = 32
+			 */
+		}
+
 		desc.mChannelsPerFrame = channels;
 		desc.mBytesPerFrame = channels * desc.mBitsPerChannel / 8;
 		desc.mBytesPerPacket =
@@ -454,8 +477,16 @@ static bool coreaudio_init_hooks(struct coreaudio_data *ca)
 			return false;
 	}
 
-	stat = set_property(ca->unit, kAudioOutputUnitProperty_SetInputCallback,
-			SCOPE_GLOBAL, 0, &callback_info, sizeof(callback_info));
+	if (ca->auSubType == kAudioUnitSubType_HALOutput) {
+		stat = set_property(ca->unit, kAudioOutputUnitProperty_SetInputCallback,
+				SCOPE_GLOBAL, 0, &callback_info, sizeof(callback_info));
+	}
+	else {
+		// Must set kAudioOutputUnitProperty_SetInputCallback for BUS_INPUT (1)
+		stat = set_property(ca->unit, kAudioOutputUnitProperty_SetInputCallback,
+				SCOPE_GLOBAL, BUS_INPUT, &callback_info, sizeof(callback_info));
+	}
+
 	if (!ca_success(stat, ca, "coreaudio_init_hooks", "set input callback"))
 		return false;
 
@@ -488,8 +519,15 @@ static void coreaudio_remove_hooks(struct coreaudio_data *ca)
 				&addr, notification_callback, ca);
 	}
 
-	set_property(ca->unit, kAudioOutputUnitProperty_SetInputCallback,
-			SCOPE_GLOBAL, 0, &callback_info, sizeof(callback_info));
+	if (ca->auSubType == kAudioUnitSubType_HALOutput) {
+		set_property(ca->unit, kAudioOutputUnitProperty_SetInputCallback,
+				SCOPE_GLOBAL, 0, &callback_info, sizeof(callback_info));
+	}
+	else {
+		// Must set kAudioOutputUnitProperty_SetInputCallback for BUS_INPUT (1)
+		set_property(ca->unit, kAudioOutputUnitProperty_SetInputCallback,
+				SCOPE_GLOBAL, BUS_INPUT, &callback_info, sizeof(callback_info));
+	}
 }
 
 static bool coreaudio_get_device_name(struct coreaudio_data *ca)
@@ -555,8 +593,11 @@ static void coreaudio_stop(struct coreaudio_data *ca)
 static bool coreaudio_init_unit(struct coreaudio_data *ca)
 {
 	AudioComponentDescription desc = {
-		.componentType    = kAudioUnitType_Output,
-		.componentSubType = kAudioUnitSubType_HALOutput
+		.componentType         = kAudioUnitType_Output,
+		.componentSubType      = ca->auSubType,
+		.componentManufacturer = kAudioUnitManufacturer_Apple,
+		.componentFlags        = 0,
+		.componentFlagsMask    = 0
 	};
 
 	AudioComponent component = AudioComponentFindNext(NULL, &desc);
@@ -580,6 +621,16 @@ static bool coreaudio_init(struct coreaudio_data *ca)
 	if (ca->au_initialized)
 		return true;
 
+	if (ca->disableAEC) {
+		blog(LOG_INFO, "Using kAudioUnitSubType_HALOutput");
+		ca->auSubType = kAudioUnitSubType_HALOutput;
+	} else {
+		blog(LOG_INFO, "Using kAudioUnitSubType_VoiceProcessingIO");
+		ca->auSubType = kAudioUnitSubType_VoiceProcessingIO;
+	}
+
+	ca->volume = -1;
+
 	if (!find_device_id_by_uid(ca))
 		return false;
 	if (!coreaudio_get_device_name(ca))
@@ -587,16 +638,60 @@ static bool coreaudio_init(struct coreaudio_data *ca)
 	if (!coreaudio_init_unit(ca))
 		return false;
 
-	stat = enable_io(ca, IO_TYPE_INPUT, true);
-	if (!ca_success(stat, ca, "coreaudio_init", "enable input io"))
-		goto fail;
+	if (ca->auSubType == kAudioUnitSubType_HALOutput) {
+		stat = enable_io(ca, IO_TYPE_INPUT, true);
+		if (!ca_success(stat, ca, "coreaudio_init", "enable input io"))
+			goto fail;
 
-	stat = enable_io(ca, IO_TYPE_OUTPUT, false);
-	if (!ca_success(stat, ca, "coreaudio_init", "disable output io"))
-		goto fail;
+		stat = enable_io(ca, IO_TYPE_OUTPUT, false);
+		if (!ca_success(stat, ca, "coreaudio_init", "disable output io"))
+			goto fail;
 
-	stat = set_property(ca->unit, kAudioOutputUnitProperty_CurrentDevice,
-			SCOPE_GLOBAL, 0, &ca->device_id, sizeof(ca->device_id));
+		stat = set_property(ca->unit, kAudioOutputUnitProperty_CurrentDevice,
+				SCOPE_GLOBAL, 0, &ca->device_id, sizeof(ca->device_id));
+	}
+	else {
+		// VPIO's input/output are always enabled, and the property
+		// kAudioOutputUnitProperty_EnableIO is not writable
+
+		// Must set kAudioOutputUnitProperty_CurrentDevice for BUS_INPUT (1)
+		stat = set_property(ca->unit, kAudioOutputUnitProperty_CurrentDevice,
+				SCOPE_GLOBAL, BUS_INPUT, &ca->device_id, sizeof(ca->device_id));
+
+		AudioObjectPropertyAddress getDefaultOutputDevicePropertyAddress = {
+			kAudioHardwarePropertyDefaultOutputDevice,
+			kAudioObjectPropertyScopeGlobal,
+			kAudioObjectPropertyElementMaster
+		};
+
+		AudioDeviceID defaultOutputDeviceID;
+		UInt32 dataSize = sizeof(AudioDeviceID);
+		OSStatus result = AudioObjectGetPropertyData(kAudioObjectSystemObject,
+			&getDefaultOutputDevicePropertyAddress,
+			0, NULL,
+			&dataSize, &defaultOutputDeviceID);
+
+		if (result == kAudioHardwareNoError) {
+			AudioObjectPropertyAddress propertyAddress = {
+				kAudioHardwareServiceDeviceProperty_VirtualMasterVolume,
+				kAudioDevicePropertyScopeOutput,
+				kAudioObjectPropertyElementMaster
+			};
+
+			Float32 volume;
+			dataSize = sizeof(Float32);
+			result = AudioObjectGetPropertyData(defaultOutputDeviceID,
+				&propertyAddress, 0, NULL, &dataSize, &volume);
+
+			if (result == kAudioHardwareNoError) {
+				ca->volume = volume;
+				volume = 1.0;
+				result = AudioObjectSetPropertyData(defaultOutputDeviceID,
+					&propertyAddress, 0, NULL, sizeof(volume), &volume);
+			}
+		}
+	}
+
 	if (!ca_success(stat, ca, "coreaudio_init", "set current device"))
 		goto fail;
 
@@ -642,6 +737,33 @@ static void coreaudio_uninit(struct coreaudio_data *ca)
 {
 	if (!ca->au_initialized)
 		return;
+
+	if (ca->volume >= 0) {
+		AudioObjectPropertyAddress getDefaultOutputDevicePropertyAddress = {
+			kAudioHardwarePropertyDefaultOutputDevice,
+			kAudioObjectPropertyScopeGlobal,
+			kAudioObjectPropertyElementMaster
+		};
+
+		AudioDeviceID defaultOutputDeviceID;
+		UInt32 dataSize = sizeof(AudioDeviceID);
+		OSStatus result = AudioObjectGetPropertyData(kAudioObjectSystemObject,
+			&getDefaultOutputDevicePropertyAddress,
+			0, NULL,
+			&dataSize, &defaultOutputDeviceID);
+
+		if (result == kAudioHardwareNoError) {
+			AudioObjectPropertyAddress propertyAddress = {
+				kAudioHardwareServiceDeviceProperty_VirtualMasterVolume,
+				kAudioDevicePropertyScopeOutput,
+				kAudioObjectPropertyElementMaster
+			};
+
+			Float32 volume = ca->volume;
+			result = AudioObjectSetPropertyData(defaultOutputDeviceID,
+				&propertyAddress, 0, NULL, sizeof(volume), &volume);
+		}
+	}
 
 	if (ca->unit) {
 		coreaudio_stop(ca);
@@ -714,6 +836,8 @@ static void coreaudio_update(void *data, obs_data_t *settings)
 	bfree(ca->device_uid);
 	ca->device_uid = bstrdup(obs_data_get_string(settings, "device_id"));
 
+	ca->disableAEC = obs_data_get_bool(settings, "disable_echo_cancellation");
+
 	coreaudio_try_init(ca);
 }
 
@@ -740,6 +864,8 @@ static void *coreaudio_create(obs_data_t *settings, obs_source_t *source,
 
 	if (!ca->device_uid)
 		ca->device_uid = bstrdup("default");
+
+	ca->disableAEC = obs_data_get_bool(settings, "disable_echo_cancellation");
 
 	coreaudio_try_init(ca);
 	return ca;

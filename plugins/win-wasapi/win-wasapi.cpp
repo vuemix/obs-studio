@@ -19,11 +19,161 @@ static void GetWASAPIDefaults(obs_data_t *settings);
 #define OBS_KSAUDIO_SPEAKER_4POINT1 \
 		(KSAUDIO_SPEAKER_SURROUND|SPEAKER_LOW_FREQUENCY)
 
+class CMediaBuffer : public IMediaBuffer
+{
+private:
+	DWORD        m_cbLength;
+	const DWORD  m_cbMaxLength;
+	LONG         m_nRefCount;  // Reference count
+	BYTE         *m_pbData;
+
+	CMediaBuffer(DWORD cbMaxLength, HRESULT& hr) :
+		m_nRefCount(1),
+		m_cbMaxLength(cbMaxLength),
+		m_cbLength(0),
+		m_pbData(NULL)
+	{
+		m_pbData = new BYTE[cbMaxLength];
+		if (!m_pbData)
+		{
+			hr = E_OUTOFMEMORY;
+		}
+	}
+
+	~CMediaBuffer()
+	{
+		if (m_pbData)
+		{
+			delete[] m_pbData;
+		}
+	}
+
+public:
+
+	// Function to create a new IMediaBuffer object and return
+	// an AddRef'd interface pointer.
+	static HRESULT Create(long cbMaxLen, IMediaBuffer **ppBuffer)
+	{
+		HRESULT hr = S_OK;
+		CMediaBuffer *pBuffer = NULL;
+
+		if (ppBuffer == NULL)
+		{
+			return E_POINTER;
+		}
+
+		pBuffer = new CMediaBuffer(cbMaxLen, hr);
+
+		if (pBuffer == NULL)
+		{
+			hr = E_OUTOFMEMORY;
+		}
+
+		if (SUCCEEDED(hr))
+		{
+			*ppBuffer = pBuffer;
+			(*ppBuffer)->AddRef();
+		}
+
+		if (pBuffer)
+		{
+			pBuffer->Release();
+		}
+		return hr;
+	}
+
+	// IUnknown methods.
+	STDMETHODIMP QueryInterface(REFIID riid, void **ppv)
+	{
+		if (ppv == NULL)
+		{
+			return E_POINTER;
+		}
+		else if (riid == __uuidof(IMediaBuffer) || riid == IID_IUnknown)
+		{
+			*ppv = static_cast<IMediaBuffer *>(this);
+			AddRef();
+			return S_OK;
+		}
+		else
+		{
+			*ppv = NULL;
+			return E_NOINTERFACE;
+		}
+	}
+
+	STDMETHODIMP_(ULONG) AddRef()
+	{
+		return InterlockedIncrement(&m_nRefCount);
+	}
+
+	STDMETHODIMP_(ULONG) Release()
+	{
+		LONG lRef = InterlockedDecrement(&m_nRefCount);
+		if (lRef == 0)
+		{
+			delete this;
+			// m_cRef is no longer valid! Return lRef.
+		}
+		return lRef;
+	}
+
+	// IMediaBuffer methods.
+	STDMETHODIMP SetLength(DWORD cbLength)
+	{
+		if (cbLength > m_cbMaxLength)
+		{
+			return E_INVALIDARG;
+		}
+		m_cbLength = cbLength;
+		return S_OK;
+	}
+
+	STDMETHODIMP GetMaxLength(DWORD *pcbMaxLength)
+	{
+		if (pcbMaxLength == NULL)
+		{
+			return E_POINTER;
+		}
+		*pcbMaxLength = m_cbMaxLength;
+		return S_OK;
+	}
+
+	STDMETHODIMP GetBufferAndLength(BYTE **ppbBuffer, DWORD *pcbLength)
+	{
+		// Either parameter can be NULL, but not both.
+		if (ppbBuffer == NULL && pcbLength == NULL)
+		{
+			return E_POINTER;
+		}
+		if (ppbBuffer)
+		{
+			*ppbBuffer = m_pbData;
+		}
+		if (pcbLength)
+		{
+			*pcbLength = m_cbLength;
+		}
+		return S_OK;
+	}
+};
+
 class WASAPISource {
 	ComPtr<IMMDevice>           device;
+	ComPtr<IMMDevice>           deviceRender;
 	ComPtr<IAudioClient>        client;
+	ComPtr<IAudioClient>        clientRender;
 	ComPtr<IAudioCaptureClient> capture;
+	ComPtr<IAudioCaptureClient> captureRender;
 	ComPtr<IAudioRenderClient>  render;
+	ComPtr<IMediaObject>        captureDMO;
+	ComPtr<IMediaBuffer>        captureDMOBuffer;
+
+	bool                        disableAEC = false;
+	int                         nChannels;
+	int                         nChannelsRender;
+	int                         nSampleRate;
+	int                         nSampleRateRender;
 
 	obs_source_t                *source;
 	string                      device_id;
@@ -49,7 +199,7 @@ class WASAPISource {
 	static DWORD WINAPI ReconnectThread(LPVOID param);
 	static DWORD WINAPI CaptureThread(LPVOID param);
 
-	bool ProcessCaptureData();
+	bool ProcessCaptureData(bool& dmoActive, FILE* pcmDumpInput, FILE* pcmDumpLoopback, FILE* pcmDumpOutput);
 
 	inline void Start();
 	inline void Stop();
@@ -128,12 +278,20 @@ void WASAPISource::UpdateSettings(obs_data_t *settings)
 	device_id       = obs_data_get_string(settings, OPT_DEVICE_ID);
 	useDeviceTiming = obs_data_get_bool(settings, OPT_USE_DEVICE_TIMING);
 	isDefaultDevice = _strcmpi(device_id.c_str(), "default") == 0;
+	disableAEC = obs_data_get_bool(settings, "disable_echo_cancellation");
 }
 
 void WASAPISource::Update(obs_data_t *settings)
 {
 	string newDevice = obs_data_get_string(settings, OPT_DEVICE_ID);
+	bool newDisableAEC = obs_data_get_bool(settings, "disable_echo_cancellation");
 	bool restart = newDevice.compare(device_id) != 0;
+
+	blog(LOG_INFO, "disable_echo: %d", newDisableAEC);
+
+	if (newDisableAEC != disableAEC) {
+		restart = true;
+	}
 
 	if (restart)
 		Stop();
@@ -160,6 +318,11 @@ bool WASAPISource::InitDevice(IMMDeviceEnumerator *enumerator)
 		res = enumerator->GetDevice(w_id, device.Assign());
 
 		bfree(w_id);
+	}
+
+	if (isInputDevice && SUCCEEDED(res) && !disableAEC) {
+		enumerator->GetDefaultAudioEndpoint(
+			eRender, eConsole, deviceRender.Assign());
 	}
 
 	return SUCCEEDED(res);
@@ -191,7 +354,7 @@ void WASAPISource::InitClient()
 			AUDCLNT_SHAREMODE_SHARED, flags,
 			BUFFER_TIME_100NS, 0, wfex, nullptr);
 	if (FAILED(res))
-		throw HRError("Failed to get initialize audio client", res);
+		throw HRError("Failed to initialize audio client", res);
 }
 
 void WASAPISource::InitRender()
@@ -200,32 +363,51 @@ void WASAPISource::InitRender()
 	HRESULT                    res;
 	LPBYTE                     buffer;
 	UINT32                     frames;
-	ComPtr<IAudioClient>       client;
 
-	res = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
-			nullptr, (void**)client.Assign());
+	if (isInputDevice) {
+		if (!deviceRender.Get())
+			return;
+		res = deviceRender->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
+			nullptr, (void**)clientRender.Assign());
+	}
+	else {
+		res = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
+			nullptr, (void**)clientRender.Assign());
+	}
+
 	if (FAILED(res))
 		throw HRError("Failed to activate client context", res);
 
-	res = client->GetMixFormat(&wfex);
+	res = clientRender->GetMixFormat(&wfex);
 	if (FAILED(res))
 		throw HRError("Failed to get mix format", res);
 
-	res = client->Initialize(
-			AUDCLNT_SHAREMODE_SHARED, 0,
-			BUFFER_TIME_100NS, 0, wfex, nullptr);
+	if (isInputDevice) {
+		res = clientRender->Initialize(
+				AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+				BUFFER_TIME_100NS, 0, wfex, nullptr);
+	}
+	else {
+		res = clientRender->Initialize(
+				AUDCLNT_SHAREMODE_SHARED, 0,
+				BUFFER_TIME_100NS, 0, wfex, nullptr);
+	}
+
 	if (FAILED(res))
-		throw HRError("Failed to get initialize audio client", res);
+		throw HRError("Failed to initialize audio client", res);
+
+	if (isInputDevice)
+		return;
 
 	/* Silent loopback fix. Prevents audio stream from stopping and */
 	/* messing up timestamps and other weird glitches during silence */
 	/* by playing a silent sample all over again. */
 
-	res = client->GetBufferSize(&frames);
+	res = clientRender->GetBufferSize(&frames);
 	if (FAILED(res))
 		throw HRError("Failed to get buffer size", res);
 
-	res = client->GetService(__uuidof(IAudioRenderClient),
+	res = clientRender->GetService(__uuidof(IAudioRenderClient),
 		(void**)render.Assign());
 	if (FAILED(res))
 		throw HRError("Failed to get render client", res);
@@ -265,6 +447,10 @@ void WASAPISource::InitFormat(WAVEFORMATEX *wfex)
 	sampleRate = wfex->nSamplesPerSec;
 	format     = AUDIO_FORMAT_FLOAT;
 	speakers   = ConvertSpeakerLayout(layout, wfex->nChannels);
+
+	blog(LOG_INFO, "##### Device Type: %s, channels: %d, bitspersample: %d, samplerate: %d",
+		isInputDevice ? "input": "output",
+		wfex->nChannels, wfex->wBitsPerSample, wfex->nSamplesPerSec);
 }
 
 void WASAPISource::InitCapture()
@@ -278,6 +464,149 @@ void WASAPISource::InitCapture()
 	if (FAILED(res))
 		throw HRError("Failed to set event handle", res);
 
+	blog(LOG_INFO, "InitCapture: %d", (int)isInputDevice);
+
+	if (isInputDevice && !disableAEC && clientRender.Get()) {
+		try {
+			res = clientRender->GetService(__uuidof(IAudioCaptureClient),
+				(void**)captureRender.Assign());
+			if (FAILED(res))
+				throw HRError("Failed to create render capture context", res);
+
+			res = CoCreateInstance(__uuidof(CWMAudioAEC),
+				nullptr, CLSCTX_INPROC_SERVER,
+				__uuidof(IMediaObject),
+				(void**)captureDMO.Assign());
+
+			if (FAILED(res))
+				throw HRError("Failed to create capture DMO", res);
+
+			ComPtr <IPropertyStore> dmoProp;
+
+			res = captureDMO->QueryInterface(__uuidof(IPropertyStore),
+				(void**)dmoProp.Assign());
+
+			if (FAILED(res))
+				throw HRError("Failed to get dmo prop", res);
+
+			PROPVARIANT pv;
+			PropVariantInit(&pv);
+			pv.vt = VT_BOOL;
+			pv.lVal = VARIANT_FALSE;
+
+			res = dmoProp->SetValue(MFPKEY_WMAAECMA_DMO_SOURCE_MODE, pv);
+			if (FAILED(res))
+				throw HRError("Failed to enable filter mode", res);
+
+			PropVariantInit(&pv);
+			pv.vt = VT_I4;
+			pv.lVal = (LONG)0; // AEC only
+
+			res = dmoProp->SetValue(MFPKEY_WMAAECMA_SYSTEM_MODE, pv);
+			if (FAILED(res))
+				throw HRError("Failed to set dmo system mode", res);
+
+#if 0 // experimental: changing AEC echo length setting
+			PropVariantInit(&pv);
+			pv.vt = VT_BOOL;
+			pv.lVal = VARIANT_TRUE;
+
+			res = dmoProp->SetValue(MFPKEY_WMAAECMA_FEATURE_MODE, pv);
+			if (FAILED(res))
+				throw HRError("Failed to enable feature mode", res);
+
+			PropVariantInit(&pv);
+			pv.vt = VT_I4;
+			pv.lVal = (LONG)1024; // Max
+
+			res = dmoProp->SetValue(MFPKEY_WMAAECMA_FEATR_ECHO_LENGTH, pv);
+			if (FAILED(res))
+				throw HRError("Failed to set echo length", res);
+#endif
+
+			DMO_MEDIA_TYPE mt;
+
+			mt.majortype = MEDIATYPE_Audio;
+			mt.subtype = MEDIASUBTYPE_PCM;
+			mt.lSampleSize = 0;
+			mt.bFixedSizeSamples = TRUE;
+			mt.bTemporalCompression = FALSE;
+			mt.formattype = FORMAT_WaveFormatEx;
+			mt.cbFormat = sizeof(WAVEFORMATEX);
+
+			CoTaskMemPtr<WAVEFORMATEX> wfex;
+
+			res = client->GetMixFormat(&wfex);
+			if (FAILED(res))
+				throw HRError("Failed to get mix format 0", res);
+			nChannels = wfex->nChannels;
+			nSampleRate = wfex->nSamplesPerSec;
+			mt.pbFormat = (BYTE*)(WAVEFORMATEX*)wfex;
+			wfex->wFormatTag = WAVE_FORMAT_PCM;
+			wfex->nChannels = 1;
+			wfex->nAvgBytesPerSec = nSampleRate * 2;
+			wfex->nBlockAlign = 2;
+			wfex->wBitsPerSample = 16;
+			wfex->cbSize = 0;
+			res = captureDMO->SetInputType(0, &mt, 0);
+			if (FAILED(res))
+				throw HRError("Failed to set input type 0", res);
+
+			res = clientRender->GetMixFormat(&wfex);
+			if (FAILED(res))
+				throw HRError("Failed to get mix format 1", res);
+			nChannelsRender = wfex->nChannels;
+			nSampleRateRender = wfex->nSamplesPerSec;
+			mt.pbFormat = (BYTE*)(WAVEFORMATEX*)wfex;
+			wfex->wFormatTag = WAVE_FORMAT_PCM;
+			wfex->nChannels = 1;
+			wfex->nAvgBytesPerSec = nSampleRateRender * 2;
+			wfex->nBlockAlign = 2;
+			wfex->wBitsPerSample = 16;
+			wfex->cbSize = 0;
+			res = captureDMO->SetInputType(1, &mt, 0);
+			if (FAILED(res))
+				throw HRError("Failed to set input type 1", res);
+
+			res = MoInitMediaType(&mt, sizeof(WAVEFORMATEX));
+			if (FAILED(res))
+				throw HRError("Failed to init dmo media type", res);
+
+			WAVEFORMATEX* pwav = (WAVEFORMATEX*)mt.pbFormat;
+			pwav->wFormatTag = WAVE_FORMAT_PCM;
+			pwav->nChannels = 1;
+			pwav->nSamplesPerSec = 22050;
+			pwav->nAvgBytesPerSec = 22050 * 2;
+			pwav->nBlockAlign = 2;
+			pwav->wBitsPerSample = 16;
+			pwav->cbSize = 0;
+
+			res = captureDMO->SetOutputType(0, &mt, 0);
+			MoFreeMediaType(&mt);
+
+			if (FAILED(res))
+				throw HRError("Failed to set dmo output type", res);
+
+			res = captureDMO->AllocateStreamingResources();
+			if (FAILED(res))
+				throw HRError("Failed to allocate dmo streaming resource", res);
+
+			res = CMediaBuffer::Create(2 * 2 * 22050, captureDMOBuffer.Assign());
+			if (FAILED(res))
+				throw HRError("Failed to allocate dmo output buffer", res);
+
+			blog(LOG_INFO, "DMO init success");
+		}
+		catch (...) {
+			captureDMO = NULL;
+			captureDMOBuffer = NULL;
+			blog(LOG_WARNING, "WASAPI: Failed to config AEC DMO");
+		}
+	}
+	else {
+		blog(LOG_INFO, "DMO NOT initialized, AEC disabled");
+	}
+
 	captureThread = CreateThread(nullptr, 0,
 			WASAPISource::CaptureThread, this,
 			0, nullptr);
@@ -285,6 +614,11 @@ void WASAPISource::InitCapture()
 		throw "Failed to create capture thread";
 
 	client->Start();
+
+	if (captureDMO.Get()) {
+		clientRender->Start();
+	}
+
 	active = true;
 
 	blog(LOG_INFO, "WASAPI: Device '%s' initialized", device_name.c_str());
@@ -294,6 +628,16 @@ void WASAPISource::Initialize()
 {
 	ComPtr<IMMDeviceEnumerator> enumerator;
 	HRESULT res;
+
+	device.Clear();
+	deviceRender.Clear();
+	client.Clear();
+	clientRender.Clear();
+	capture.Clear();
+	captureRender.Clear();
+	render.Clear();
+	captureDMO.Clear();
+	captureDMOBuffer.Clear();
 
 	res = CoCreateInstance(__uuidof(MMDeviceEnumerator),
 			nullptr, CLSCTX_ALL,
@@ -308,7 +652,7 @@ void WASAPISource::Initialize()
 	device_name = GetDeviceName(device);
 
 	InitClient();
-	if (!isInputDevice) InitRender();
+	InitRender();
 	InitCapture();
 }
 
@@ -383,7 +727,7 @@ DWORD WINAPI WASAPISource::ReconnectThread(LPVOID param)
 	return 0;
 }
 
-bool WASAPISource::ProcessCaptureData()
+bool WASAPISource::ProcessCaptureData(bool& dmoActive, FILE* pcmDumpInput, FILE* pcmDumpLoopback, FILE* pcmDumpOutput)
 {
 	HRESULT res;
 	LPBYTE  buffer;
@@ -418,19 +762,137 @@ bool WASAPISource::ProcessCaptureData()
 		}
 
 		obs_source_audio data = {};
-		data.data[0]          = (const uint8_t*)buffer;
-		data.frames           = (uint32_t)frames;
-		data.speakers         = speakers;
-		data.samples_per_sec  = sampleRate;
-		data.format           = format;
-		data.timestamp        = useDeviceTiming ?
-			ts*100 : os_gettime_ns();
+		bool outputDone = false;
 
-		if (!useDeviceTiming)
-			data.timestamp -= (uint64_t)frames * 1000000000ULL /
+		if (captureDMO.Get() && frames) {
+			do {
+				ComPtr<IMediaBuffer> inMediaBuffer, outMediaBuffer;
+				BYTE* pData;
+
+				res = CMediaBuffer::Create(frames * 2, inMediaBuffer.Assign());
+				if (FAILED(res)) {
+					blog(LOG_ERROR, "Failed to allocate inMediaBuffer %x", res);
+					break;
+				}
+				inMediaBuffer->SetLength(frames * 2);
+				inMediaBuffer->GetBufferAndLength(&pData, NULL);
+				for (UINT32 i = 0; i < frames; i++) {
+					float f = ((float*)buffer)[i * nChannels];
+					((short*)pData)[i] = (short)(((f > 1.0f) ? 1.0f : (f < -1.0f) ? -1.0f : f) * 0x7fff);
+				}
+
+				res = captureRender->GetNextPacketSize(&captureSize);
+				if (FAILED(res) || !captureSize)
+					break;
+
+				LPBYTE outbuffer;
+				UINT32 outframes = 0;
+				UINT64 outPos, outTs;
+
+				res = captureRender->GetBuffer(&outbuffer, &outframes, &flags, &outPos, &outTs);
+				if (FAILED(res))
+					break;
+
+				if (!outframes) {
+					captureRender->ReleaseBuffer(outframes);
+					break;
+				}
+
+				if (pcmDumpInput != NULL)
+					fwrite(pData, 1, frames * 2, pcmDumpInput);
+
+				res = CMediaBuffer::Create(outframes * 2, outMediaBuffer.Assign());
+				if (FAILED(res)) {
+					blog(LOG_ERROR, "Failed to allocate outMediaBuffer %x", res);
+					captureRender->ReleaseBuffer(outframes);
+					break;
+				}
+				outMediaBuffer->SetLength(outframes * 2);
+				outMediaBuffer->GetBufferAndLength(&pData, NULL);
+				for (UINT32 i = 0; i < outframes; i++) {
+					float f = ((float*)outbuffer)[i * nChannelsRender];
+					((short*)pData)[i] = (short)(((f > 1.0f) ? 1.0f : (f < -1.0f) ? -1.0f : f) * 0x7fff);
+				}
+
+				captureRender->ReleaseBuffer(outframes);
+
+				if (pcmDumpLoopback != NULL)
+					fwrite(pData, 1, outframes * 2, pcmDumpLoopback);
+
+				DMO_OUTPUT_DATA_BUFFER dmoOut;
+				DWORD dmoStatus;
+				dmoOut.pBuffer = captureDMOBuffer;
+				captureDMOBuffer->SetLength(0);
+
+				if (!dmoActive) {
+					captureDMO->Flush();
+					blog(LOG_INFO, "DMO Flush");
+				}
+
+				res = captureDMO->ProcessInput(0, inMediaBuffer,
+					DMO_INPUT_DATA_BUFFERF_SYNCPOINT|DMO_INPUT_DATA_BUFFERF_TIME|DMO_INPUT_DATA_BUFFERF_TIMELENGTH,
+					ts, (10000000ll * frames) / nSampleRate);
+				if (FAILED(res)) {
+					blog(LOG_ERROR, "Failed to process dmo input 0 %x", res);
+					break;
+				}
+
+				res = captureDMO->ProcessInput(1, outMediaBuffer,
+					DMO_INPUT_DATA_BUFFERF_SYNCPOINT|DMO_INPUT_DATA_BUFFERF_TIME|DMO_INPUT_DATA_BUFFERF_TIMELENGTH,
+					outTs, (10000000ll * outframes) / nSampleRateRender);
+				if (FAILED(res)) {
+					blog(LOG_ERROR, "Failed to process dmo input 1 %x", res);
+					break;
+				}
+
+				res = captureDMO->ProcessOutput(0, 1, &dmoOut, &dmoStatus);
+				if (FAILED(res)) {
+					blog(LOG_ERROR, "Failed to process dmo output %x", res);
+					break;
+				}
+
+				dmoActive = true;
+				outputDone = true;
+
+				DWORD len;
+				captureDMOBuffer->GetBufferAndLength(&pData, &len);
+
+				if (len > 1) {
+					data.data[0] = (const uint8_t*)pData;
+					data.frames = len / 2;
+					data.speakers = SPEAKERS_MONO;
+					data.samples_per_sec = 22050;
+					data.format = AUDIO_FORMAT_16BIT;
+					data.timestamp = os_gettime_ns() -
+						(uint64_t)data.frames * 1000000000ULL /
+						(uint64_t)data.samples_per_sec;
+
+					obs_source_output_audio(source, &data);
+
+					if (pcmDumpOutput != NULL)
+						fwrite(pData, 1, len, pcmDumpOutput);
+				}
+			}
+			while (false);
+		}
+
+		if (!outputDone) {
+			dmoActive = false;
+
+			data.data[0] = (const uint8_t*)buffer;
+			data.frames = (uint32_t)frames;
+			data.speakers = speakers;
+			data.samples_per_sec = sampleRate;
+			data.format = format;
+			data.timestamp = useDeviceTiming ?
+				ts * 100 : os_gettime_ns();
+
+			if (!useDeviceTiming)
+				data.timestamp -= (uint64_t)frames * 1000000000ULL /
 				(uint64_t)sampleRate;
 
-		obs_source_output_audio(source, &data);
+			obs_source_output_audio(source, &data);
+		}
 
 		capture->ReleaseBuffer(frames);
 	}
@@ -462,12 +924,31 @@ DWORD WINAPI WASAPISource::CaptureThread(LPVOID param)
 
 	os_set_thread_name("win-wasapi: capture thread");
 
+	FILE* pcmDumpInput = NULL;
+	FILE* pcmDumpLoopback = NULL;
+	FILE* pcmDumpOutput = NULL;
+	bool dmoActive = true;
+
+#if 0 // for debugging only
+
+	if (source->captureDMO.Get()) {
+		pcmDumpInput    = fopen("aec_in0.pcm", "wb");
+		pcmDumpLoopback = fopen("aec_in1.pcm", "wb");
+		pcmDumpOutput   = fopen("aec_out.pcm", "wb");
+	}
+
+#endif
+
 	while (WaitForCaptureSignal(2, sigs, dur)) {
-		if (!source->ProcessCaptureData()) {
+		if (!source->ProcessCaptureData(dmoActive, pcmDumpInput, pcmDumpLoopback, pcmDumpOutput)) {
 			reconnect = true;
 			break;
 		}
 	}
+
+	if (pcmDumpInput    != NULL) { fclose(pcmDumpInput); }
+	if (pcmDumpLoopback != NULL) { fclose(pcmDumpLoopback); }
+	if (pcmDumpOutput   != NULL) { fclose(pcmDumpOutput); }
 
 	source->client->Stop();
 
