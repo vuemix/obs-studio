@@ -15,6 +15,10 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ******************************************************************************/
 
+// With Xcode 11, function pointer cast requirement of objc_msgSend would be
+// enforced unless OBJC_OLD_DISPATCH_PROTOTYPES is set to 1
+#define OBJC_OLD_DISPATCH_PROTOTYPES 1
+
 #include "util/platform.h"
 #include "util/dstr.h"
 #include "obs.h"
