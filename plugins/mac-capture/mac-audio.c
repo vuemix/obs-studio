@@ -724,6 +724,7 @@ static void coreaudio_try_init(struct coreaudio_data *ca)
 		               "uid: %s, waiting for connection",
 		               ca->device_uid);
 
+		ca->disableAEC = true; // always retry without AEC
 		ca->retry_time = 2000;
 
 		if (ca->no_devices)
