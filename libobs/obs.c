@@ -23,6 +23,8 @@
 #include "obs.h"
 #include "obs-internal.h"
 
+#define VUEMIX_DISABLE_HOTKEYS
+
 struct obs_core *obs = NULL;
 
 extern void add_default_module_paths(void);
@@ -828,8 +830,10 @@ static bool obs_init(const char *locale, const char *module_config_path,
 		return false;
 	if (!obs_init_handlers())
 		return false;
+#ifndef VUEMIX_DISABLE_HOTKEYS
 	if (!obs_init_hotkeys())
 		return false;
+#endif
 
 	if (module_config_path)
 		obs->module_config_path = bstrdup(module_config_path);
@@ -982,12 +986,16 @@ void obs_shutdown(void)
 	da_free(obs->transition_types);
 
 	stop_video();
+#ifndef VUEMIX_DISABLE_HOTKEYS
 	stop_hotkeys();
+#endif
 
 	obs_free_audio();
 	obs_free_data();
 	obs_free_video();
+#ifndef VUEMIX_DISABLE_HOTKEYS
 	obs_free_hotkeys();
+#endif
 	obs_free_graphics();
 	proc_handler_destroy(obs->procs);
 	signal_handler_destroy(obs->signals);
