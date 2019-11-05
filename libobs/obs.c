@@ -23,7 +23,9 @@
 #include "obs.h"
 #include "obs-internal.h"
 
+#if defined(__APPLE__)
 #define VUEMIX_DISABLE_HOTKEYS
+#endif
 
 struct obs_core *obs = NULL;
 
