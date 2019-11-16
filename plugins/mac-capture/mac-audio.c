@@ -38,6 +38,7 @@ struct coreaudio_data {
 	AudioUnit           unit;
 	AudioDeviceID       device_id;
 	AudioBufferList    *buf_list;
+	AudioBufferList    *buf_list_in_use;
 	bool                au_initialized;
 	bool                active;
 	bool                default_device;
@@ -58,6 +59,7 @@ struct coreaudio_data {
 	OSType              auSubType;
 	Float32             volume;
 	bool                disableAEC;
+	bool                disableAECVolumeBoost;
 };
 
 static bool get_default_output_device(struct coreaudio_data *ca)
@@ -227,38 +229,49 @@ static bool coreaudio_init_format(struct coreaudio_data *ca)
 	if (!ca_success(stat, ca, "coreaudio_init_format", "get input format"))
 		return false;
 
-	/* Certain types of devices have no limit on channel count, and
-	 * there's no way to know the actual number of channels it's using,
-	 * so if we encounter this situation just force to what is defined in output */
-	if (desc.mChannelsPerFrame > 8 || ca->auSubType == kAudioUnitSubType_VoiceProcessingIO) {
-		if (ca->auSubType == kAudioUnitSubType_VoiceProcessingIO) {
-			// Force the stream format to MONO for VPIO. If VPIO is unhappy, the
-			// AudioUnitRender() calls (which retrieve captured data) inside
-			// input_callback would fail (with error code such as -50)
-			channels = 1;
+	blog(LOG_INFO, "coreaudio: input format => %lf 0x%X-0x%X %d %d %d %d %d",
+		desc.mSampleRate, desc.mFormatID, desc.mFormatFlags, desc.mBytesPerPacket,
+		desc.mFramesPerPacket, desc.mBytesPerFrame, desc.mChannelsPerFrame, desc.mBitsPerChannel);
 
-			/* A known acceptable format:
-			  mSampleRate = 44100
-			  mFormatID = 1819304813 // lpcm
-			  mFormatFlags = 41 // kAudioFormatFlagsAudioUnitCanonical (planar float 32)
-			  mBytesPerPacket = 4
-			  mFramesPerPacket = 1
-			  mBytesPerFrame = 4
-			  mChannelsPerFrame = 1 // mono
-			  mBitsPerChannel = 32
-			 */
+	if (ca->auSubType == kAudioUnitSubType_HALOutput) {
+		/* Certain types of devices have no limit on channel count, and
+		 * there's no way to know the actual number of channels it's using,
+		 * so if we encounter this situation just force to what is defined in output */
+		if (desc.mChannelsPerFrame > 8) {
+			desc.mChannelsPerFrame = channels;
+			desc.mBytesPerFrame = channels * desc.mBitsPerChannel / 8;
+			desc.mBytesPerPacket =
+					desc.mFramesPerPacket * desc.mBytesPerFrame;
 		}
 
-		desc.mChannelsPerFrame = channels;
-		desc.mBytesPerFrame = channels * desc.mBitsPerChannel / 8;
-		desc.mBytesPerPacket =
-				desc.mFramesPerPacket * desc.mBytesPerFrame;
+		stat = set_property(ca->unit, kAudioUnitProperty_StreamFormat,
+				SCOPE_OUTPUT, BUS_INPUT, &desc, size);
+		if (!ca_success(stat, ca, "coreaudio_init_format", "set output format"))
+			return false;
 	}
+	else {
+		// Use VPIO output format as-is
+		size = sizeof(desc);
+		stat = get_property(ca->unit, kAudioUnitProperty_StreamFormat,
+				SCOPE_OUTPUT, BUS_INPUT, &desc, &size);
+		if (!ca_success(stat, ca, "coreaudio_init_format", "get vpio output format"))
+			return false;
 
-	stat = set_property(ca->unit, kAudioUnitProperty_StreamFormat,
-			SCOPE_OUTPUT, BUS_INPUT, &desc, size);
-	if (!ca_success(stat, ca, "coreaudio_init_format", "set output format"))
-		return false;
+		blog(LOG_INFO, "coreaudio: vpio output format => %lf 0x%X-0x%X %d %d %d %d %d",
+			desc.mSampleRate, desc.mFormatID, desc.mFormatFlags, desc.mBytesPerPacket,
+			desc.mFramesPerPacket, desc.mBytesPerFrame, desc.mChannelsPerFrame, desc.mBitsPerChannel);
+
+		/* An example VPIO output format:
+		  mSampleRate = 44100
+		  mFormatID = 1819304813 // lpcm
+		  mFormatFlags = 9
+		  mBytesPerPacket = 4
+		  mFramesPerPacket = 1
+		  mBytesPerFrame = 4
+		  mChannelsPerFrame = 1 // mono
+		  mBitsPerChannel = 32
+		 */
+	}
 
 	if (desc.mFormatID != kAudioFormatLinearPCM) {
 		ca_warn(ca, "coreaudio_init_format", "format is not PCM");
@@ -311,6 +324,8 @@ static bool coreaudio_init_buffer(struct coreaudio_data *ca)
 	if (!ca_success(stat, ca, "coreaudio_init_buffer", "get frame size"))
 		return false;
 
+	blog(LOG_INFO, "coreaudio: buffer frame size => %d", frames);
+
 	/* ---------------------- */
 
 	ca->buf_list = bmalloc(buf_size);
@@ -323,11 +338,20 @@ static bool coreaudio_init_buffer(struct coreaudio_data *ca)
 		return false;
 	}
 
+	blog(LOG_INFO, "coreaudio: buffer list mNumberBuffers => %d", ca->buf_list->mNumberBuffers);
+
+	ca->buf_list_in_use = bmalloc(buf_size);
+	ca->buf_list_in_use->mNumberBuffers = ca->buf_list->mNumberBuffers;
+
 	for (UInt32 i = 0; i < ca->buf_list->mNumberBuffers; i++) {
-		size = ca->buf_list->mBuffers[i].mDataByteSize;
-		ca->buf_list->mBuffers[i].mData = bmalloc(size);
+		size = ca->buf_list_in_use->mBuffers[i].mDataByteSize = ca->buf_list->mBuffers[i].mDataByteSize;
+		ca->buf_list_in_use->mBuffers[i].mData = ca->buf_list->mBuffers[i].mData = bmalloc(size);
+		ca->buf_list_in_use->mBuffers[i].mNumberChannels = ca->buf_list->mBuffers[i].mNumberChannels;
+
+		blog(LOG_INFO, "coreaudio: buffer[%d] => mNumberChannels %d mDataByteSize %d", i,
+			ca->buf_list->mBuffers[i].mNumberChannels, ca->buf_list->mBuffers[i].mDataByteSize);
 	}
-	
+
 	return true;
 }
 
@@ -353,10 +377,16 @@ static OSStatus input_callback(
 	OSStatus stat;
 	struct obs_source_audio audio;
 
+	for (UInt32 i = 0; i < ca->buf_list->mNumberBuffers; i++)
+		ca->buf_list_in_use->mBuffers[i].mDataByteSize = ca->buf_list->mBuffers[i].mDataByteSize;
+
+	// We might receive error code -50 (kAudio_ParamError) for errors in the AudioBufferList argument
 	stat = AudioUnitRender(ca->unit, action_flags, ts_data, bus_num, frames,
-			ca->buf_list);
-	if (!ca_success(stat, ca, "input_callback", "audio retrieval"))
+			ca->buf_list_in_use);
+	if (!ca_success(stat, ca, "input_callback", "audio retrieval")) {
+		blog(LOG_INFO, "coreaudio: AudioUnitRender returns %d, bus %d, frames %d", stat, bus_num, frames);
 		return noErr;
+	}
 
 	for (UInt32 i = 0; i < ca->buf_list->mNumberBuffers; i++)
 		audio.data[i] = ca->buf_list->mBuffers[i].mData;
@@ -658,36 +688,38 @@ static bool coreaudio_init(struct coreaudio_data *ca)
 		stat = set_property(ca->unit, kAudioOutputUnitProperty_CurrentDevice,
 				SCOPE_GLOBAL, BUS_INPUT, &ca->device_id, sizeof(ca->device_id));
 
-		AudioObjectPropertyAddress getDefaultOutputDevicePropertyAddress = {
-			kAudioHardwarePropertyDefaultOutputDevice,
-			kAudioObjectPropertyScopeGlobal,
-			kAudioObjectPropertyElementMaster
-		};
-
-		AudioDeviceID defaultOutputDeviceID;
-		UInt32 dataSize = sizeof(AudioDeviceID);
-		OSStatus result = AudioObjectGetPropertyData(kAudioObjectSystemObject,
-			&getDefaultOutputDevicePropertyAddress,
-			0, NULL,
-			&dataSize, &defaultOutputDeviceID);
-
-		if (result == kAudioHardwareNoError) {
-			AudioObjectPropertyAddress propertyAddress = {
-				kAudioHardwareServiceDeviceProperty_VirtualMasterVolume,
-				kAudioDevicePropertyScopeOutput,
+		if (!ca->disableAECVolumeBoost) {
+			AudioObjectPropertyAddress getDefaultOutputDevicePropertyAddress = {
+				kAudioHardwarePropertyDefaultOutputDevice,
+				kAudioObjectPropertyScopeGlobal,
 				kAudioObjectPropertyElementMaster
 			};
 
-			Float32 volume;
-			dataSize = sizeof(Float32);
-			result = AudioObjectGetPropertyData(defaultOutputDeviceID,
-				&propertyAddress, 0, NULL, &dataSize, &volume);
+			AudioDeviceID defaultOutputDeviceID;
+			UInt32 dataSize = sizeof(AudioDeviceID);
+			OSStatus result = AudioObjectGetPropertyData(kAudioObjectSystemObject,
+				&getDefaultOutputDevicePropertyAddress,
+				0, NULL,
+				&dataSize, &defaultOutputDeviceID);
 
 			if (result == kAudioHardwareNoError) {
-				ca->volume = volume;
-				volume = 1.0;
-				result = AudioObjectSetPropertyData(defaultOutputDeviceID,
-					&propertyAddress, 0, NULL, sizeof(volume), &volume);
+				AudioObjectPropertyAddress propertyAddress = {
+					kAudioHardwareServiceDeviceProperty_VirtualMasterVolume,
+					kAudioDevicePropertyScopeOutput,
+					kAudioObjectPropertyElementMaster
+				};
+
+				Float32 volume;
+				dataSize = sizeof(Float32);
+				result = AudioObjectGetPropertyData(defaultOutputDeviceID,
+					&propertyAddress, 0, NULL, &dataSize, &volume);
+
+				if (result == kAudioHardwareNoError) {
+					ca->volume = volume;
+					volume = 1.0;
+					result = AudioObjectSetPropertyData(defaultOutputDeviceID,
+						&propertyAddress, 0, NULL, sizeof(volume), &volume);
+				}
 			}
 		}
 	}
@@ -783,7 +815,8 @@ static void coreaudio_uninit(struct coreaudio_data *ca)
 	ca->au_initialized = false;
 
 	buf_list_free(ca->buf_list);
-	ca->buf_list = NULL;
+	bfree(ca->buf_list_in_use);
+	ca->buf_list = ca->buf_list_in_use = NULL;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -838,6 +871,7 @@ static void coreaudio_update(void *data, obs_data_t *settings)
 	ca->device_uid = bstrdup(obs_data_get_string(settings, "device_id"));
 
 	ca->disableAEC = obs_data_get_bool(settings, "disable_echo_cancellation");
+	ca->disableAECVolumeBoost = obs_data_get_bool(settings, "disable_aec_volume_boost");
 
 	coreaudio_try_init(ca);
 }
@@ -867,6 +901,7 @@ static void *coreaudio_create(obs_data_t *settings, obs_source_t *source,
 		ca->device_uid = bstrdup("default");
 
 	ca->disableAEC = obs_data_get_bool(settings, "disable_echo_cancellation");
+	ca->disableAECVolumeBoost = obs_data_get_bool(settings, "disable_aec_volume_boost");
 
 	coreaudio_try_init(ca);
 	return ca;
