@@ -59,7 +59,7 @@ struct coreaudio_data {
 	OSType              auSubType;
 	Float32             volume;
 	bool                disableAEC;
-	bool                disableAECVolumeBoost;
+	bool                enableAECVolumeBoost;
 };
 
 static bool get_default_output_device(struct coreaudio_data *ca)
@@ -377,16 +377,35 @@ static OSStatus input_callback(
 	OSStatus stat;
 	struct obs_source_audio audio;
 
-	for (UInt32 i = 0; i < ca->buf_list->mNumberBuffers; i++)
-		ca->buf_list_in_use->mBuffers[i].mDataByteSize = ca->buf_list->mBuffers[i].mDataByteSize;
+	do {
+		for (UInt32 i = 0; i < ca->buf_list->mNumberBuffers; i++)
+			ca->buf_list_in_use->mBuffers[i].mDataByteSize = ca->buf_list->mBuffers[i].mDataByteSize;
 
-	// We might receive error code -50 (kAudio_ParamError) for errors in the AudioBufferList argument
-	stat = AudioUnitRender(ca->unit, action_flags, ts_data, bus_num, frames,
-			ca->buf_list_in_use);
-	if (!ca_success(stat, ca, "input_callback", "audio retrieval")) {
-		blog(LOG_INFO, "coreaudio: AudioUnitRender returns %d, bus %d, frames %d", stat, bus_num, frames);
-		return noErr;
+		stat = AudioUnitRender(ca->unit, action_flags, ts_data, bus_num, frames, ca->buf_list_in_use);
+
+		// We might receive error code -50 (kAudio_ParamError) for errors in the AudioBufferList argument
+		if (stat == kAudio_ParamError) {
+			blog(LOG_INFO, "coreaudio: AudioUnitRender returns %d, bus %d, frames %d", stat, bus_num, frames);
+			for (UInt32 i = 0; i < ca->buf_list->mNumberBuffers; i++) {
+				if (ca->buf_list->mBuffers[i].mDataByteSize >= 512 * 1024) { // limit buffer size to under 1M
+					return noErr;
+				}
+				ca->buf_list->mBuffers[i].mDataByteSize *= 2;
+				bfree(ca->buf_list->mBuffers[i].mData);
+				ca->buf_list_in_use->mBuffers[i].mData = ca->buf_list->mBuffers[i].mData =
+					bmalloc(ca->buf_list->mBuffers[i].mDataByteSize);
+				blog(LOG_INFO, "coreaudio: buffer[%d] re-alloc => mDataByteSize %d", i,
+					ca->buf_list->mBuffers[i].mDataByteSize);
+			}
+			continue; // Retry AudioUnitRender() with bigger buffers
+		}
+
+		if (!ca_success(stat, ca, "input_callback", "audio retrieval")) {
+			blog(LOG_INFO, "coreaudio: AudioUnitRender returns %d, bus %d, frames %d", stat, bus_num, frames);
+			return noErr;
+		}
 	}
+	while (false);
 
 	for (UInt32 i = 0; i < ca->buf_list->mNumberBuffers; i++)
 		audio.data[i] = ca->buf_list->mBuffers[i].mData;
@@ -688,7 +707,7 @@ static bool coreaudio_init(struct coreaudio_data *ca)
 		stat = set_property(ca->unit, kAudioOutputUnitProperty_CurrentDevice,
 				SCOPE_GLOBAL, BUS_INPUT, &ca->device_id, sizeof(ca->device_id));
 
-		if (!ca->disableAECVolumeBoost) {
+		if (ca->enableAECVolumeBoost) {
 			AudioObjectPropertyAddress getDefaultOutputDevicePropertyAddress = {
 				kAudioHardwarePropertyDefaultOutputDevice,
 				kAudioObjectPropertyScopeGlobal,
@@ -871,7 +890,7 @@ static void coreaudio_update(void *data, obs_data_t *settings)
 	ca->device_uid = bstrdup(obs_data_get_string(settings, "device_id"));
 
 	ca->disableAEC = obs_data_get_bool(settings, "disable_echo_cancellation");
-	ca->disableAECVolumeBoost = obs_data_get_bool(settings, "disable_aec_volume_boost");
+	ca->enableAECVolumeBoost = obs_data_get_bool(settings, "enable_aec_volume_boost");
 
 	coreaudio_try_init(ca);
 }
@@ -901,7 +920,7 @@ static void *coreaudio_create(obs_data_t *settings, obs_source_t *source,
 		ca->device_uid = bstrdup("default");
 
 	ca->disableAEC = obs_data_get_bool(settings, "disable_echo_cancellation");
-	ca->disableAECVolumeBoost = obs_data_get_bool(settings, "disable_aec_volume_boost");
+	ca->enableAECVolumeBoost = obs_data_get_bool(settings, "enable_aec_volume_boost");
 
 	coreaudio_try_init(ca);
 	return ca;
