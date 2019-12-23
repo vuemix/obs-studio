@@ -302,7 +302,7 @@ void WASAPISource::UpdateSettings(obs_data_t *settings)
 	aecInputDelay = (int)obs_data_get_int(settings, OPT_AEC_IN_DELAY);
 	aecDumpFileDir = obs_data_get_string(settings, OPT_AEC_DUMP_DIR);
 
-	blog(LOG_INFO, "disable_echo: %d, input delay: %d, dump dir: %s",
+	blog(LOG_INFO, "disable_aec: %d, input delay: %d, dump dir: %s",
 		disableAEC, aecInputDelay, aecDumpFileDir.c_str());
 }
 
@@ -899,7 +899,8 @@ bool WASAPISource::ProcessCaptureData(bool& dmoActive, deque<ComPtr<IMediaBuffer
 
 							if (pcmDumpOutput) { fwrite(pData, 1, len, pcmDumpOutput); }
 						}
-					} while (false);
+					}
+					while (false);
 				}
 
 				if (!outputDone) {

@@ -32,6 +32,9 @@
 #define TEXT_DEVICE         obs_module_text("CoreAudio.Device")
 #define TEXT_DEVICE_DEFAULT obs_module_text("CoreAudio.Device.Default")
 
+#define OPT_DISABLE_AEC          "disable_echo_cancellation"
+#define OPT_AEC_ENABLE_VOL_BOOST "enable_aec_volume_boost"
+
 struct coreaudio_data {
 	char               *device_name;
 	char               *device_uid;
@@ -889,8 +892,8 @@ static void coreaudio_update(void *data, obs_data_t *settings)
 	bfree(ca->device_uid);
 	ca->device_uid = bstrdup(obs_data_get_string(settings, "device_id"));
 
-	ca->disableAEC = obs_data_get_bool(settings, "disable_echo_cancellation");
-	ca->enableAECVolumeBoost = obs_data_get_bool(settings, "enable_aec_volume_boost");
+	ca->disableAEC = obs_data_get_bool(settings, OPT_DISABLE_AEC);
+	ca->enableAECVolumeBoost = obs_data_get_bool(settings, OPT_AEC_ENABLE_VOL_BOOST);
 
 	coreaudio_try_init(ca);
 }
@@ -898,6 +901,8 @@ static void coreaudio_update(void *data, obs_data_t *settings)
 static void coreaudio_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, "device_id", "default");
+	obs_data_set_default_bool(settings, OPT_DISABLE_AEC, false);
+	obs_data_set_default_bool(settings, OPT_AEC_ENABLE_VOL_BOOST, false);
 }
 
 static void *coreaudio_create(obs_data_t *settings, obs_source_t *source,
@@ -919,8 +924,8 @@ static void *coreaudio_create(obs_data_t *settings, obs_source_t *source,
 	if (!ca->device_uid)
 		ca->device_uid = bstrdup("default");
 
-	ca->disableAEC = obs_data_get_bool(settings, "disable_echo_cancellation");
-	ca->enableAECVolumeBoost = obs_data_get_bool(settings, "enable_aec_volume_boost");
+	ca->disableAEC = obs_data_get_bool(settings, OPT_DISABLE_AEC);
+	ca->enableAECVolumeBoost = obs_data_get_bool(settings, OPT_AEC_ENABLE_VOL_BOOST);
 
 	coreaudio_try_init(ca);
 	return ca;
@@ -962,6 +967,10 @@ static obs_properties_t *coreaudio_properties(bool input)
 	}
 
 	device_list_free(&devices);
+
+	obs_properties_add_bool(props, OPT_DISABLE_AEC, "Disable Echo Cancellation");
+	obs_properties_add_bool(props, OPT_AEC_ENABLE_VOL_BOOST, "Enable AEC Volume Boost");
+
 	return props;
 }
 
