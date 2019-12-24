@@ -311,8 +311,12 @@ void WASAPISource::Update(obs_data_t *settings)
 	string newDevice = obs_data_get_string(settings, OPT_DEVICE_ID);
 	bool newDisableAEC = obs_data_get_bool(settings, OPT_DISABLE_AEC);
 	int newInputDelay = (int)obs_data_get_int(settings, OPT_AEC_IN_DELAY);
-	bool restart = (newDevice.compare(device_id) != 0 ||
-		newDisableAEC != disableAEC || newInputDelay != aecInputDelay);
+	string newDumpFileDir = obs_data_get_string(settings, OPT_AEC_DUMP_DIR);
+	bool restart = (
+		newDevice.compare(device_id) != 0 ||
+		newDisableAEC != disableAEC ||
+		newInputDelay != aecInputDelay ||
+		newDumpFileDir.compare(aecDumpFileDir) != 0);
 
 	if (restart)
 		Stop();
@@ -800,9 +804,8 @@ bool WASAPISource::ProcessCaptureData(bool& dmoActive, deque<ComPtr<IMediaBuffer
 		if (captureDMO.Get()) {
 			ComPtr<IMediaBuffer> inMediaBuffer, outMediaBuffer;
 			BYTE* pData;
-			UINT64 osTs = (os_gettime_ns() / 100) - 100000 /*10ms*/;
 
-			if (SUCCEEDED(CMediaBuffer::Create(frames * 2, osTs, inMediaBuffer.Assign()))) {
+			if (SUCCEEDED(CMediaBuffer::Create(frames * 2, ts, inMediaBuffer.Assign()))) {
 				inMediaBuffer->SetLength(frames * 2);
 				inMediaBuffer->GetBufferAndLength(&pData, NULL);
 				for (UINT32 i = 0; i < frames; i++) {
@@ -824,7 +827,7 @@ bool WASAPISource::ProcessCaptureData(bool& dmoActive, deque<ComPtr<IMediaBuffer
 			if (SUCCEEDED(captureRender->GetNextPacketSize(&captureSize)) && captureSize &&
 				SUCCEEDED(captureRender->GetBuffer(&outbuffer, &outframes, &flags, &outPos, &outTs))) {
 
-				if (outframes && SUCCEEDED(CMediaBuffer::Create(outframes * 2, osTs, outMediaBuffer.Assign()))) {
+				if (outframes && SUCCEEDED(CMediaBuffer::Create(outframes * 2, 0, outMediaBuffer.Assign()))) {
 					outMediaBuffer->SetLength(outframes * 2);
 					outMediaBuffer->GetBufferAndLength(&pData, NULL);
 					for (UINT32 i = 0; i < outframes; i++) {
@@ -865,7 +868,7 @@ bool WASAPISource::ProcessCaptureData(bool& dmoActive, deque<ComPtr<IMediaBuffer
 
 						res = captureDMO->ProcessInput(1, outMediaBuffer,
 							DMO_INPUT_DATA_BUFFERF_SYNCPOINT | DMO_INPUT_DATA_BUFFERF_TIME,
-							((CMediaBuffer*)outMediaBuffer.Get())->GetTimestamp(), 0);
+							outTs, 0);
 						if (FAILED(res)) {
 							blog(LOG_ERROR, "Failed to process dmo input 1 %x", res);
 							break;
@@ -893,7 +896,9 @@ bool WASAPISource::ProcessCaptureData(bool& dmoActive, deque<ComPtr<IMediaBuffer
 							data.speakers = SPEAKERS_MONO;
 							data.samples_per_sec = 22050;
 							data.format = AUDIO_FORMAT_16BIT;
-							data.timestamp = ((CMediaBuffer*)inMediaBuffer.Get())->GetTimestamp() * 100;
+							data.timestamp = os_gettime_ns() -
+								(uint64_t)data.frames * 1000000000ULL /
+								(uint64_t)data.samples_per_sec;
 
 							obs_source_output_audio(source, &data);
 
@@ -915,7 +920,9 @@ bool WASAPISource::ProcessCaptureData(bool& dmoActive, deque<ComPtr<IMediaBuffer
 						data.speakers = SPEAKERS_MONO;
 						data.samples_per_sec = inputSampleRate;
 						data.format = AUDIO_FORMAT_16BIT;
-						data.timestamp = ((CMediaBuffer*)inMediaBuffer.Get())->GetTimestamp() * 100;
+						data.timestamp = os_gettime_ns() -
+							(uint64_t)data.frames * 1000000000ULL /
+							(uint64_t)data.samples_per_sec;
 
 						obs_source_output_audio(source, &data);
 					}
