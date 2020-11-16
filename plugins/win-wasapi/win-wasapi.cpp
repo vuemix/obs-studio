@@ -16,6 +16,7 @@ using namespace std;
 #define OPT_DEVICE_ID         "device_id"
 #define OPT_USE_DEVICE_TIMING "use_device_timing"
 #define OPT_DISABLE_AEC       "disable_echo_cancellation"
+#define OPT_IN_FMT_MODE       "input_format_mode"
 #define OPT_AEC_IN_DELAY      "aec_input_delay"
 #define OPT_AEC_DUMP_DIR      "aec_dump_file_dir"
 
@@ -185,14 +186,13 @@ class WASAPISource {
 	ComPtr<IAudioRenderClient>  render;
 	ComPtr<IMediaObject>        captureDMO;
 	ComPtr<IMediaBuffer>        captureDMOBuffer;
+	CoTaskMemPtr<WAVEFORMATEX>  wfexClient;
+	CoTaskMemPtr<WAVEFORMATEX>  wfexClientRender;
 
 	bool                        disableAEC = false;
+	int                         inFormatMode = 0;
 	int                         aecInputDelay = 2; // in 10ms blocks
 	string                      aecDumpFileDir;
-
-	int                         nChannels;
-	int                         nChannelsRender;
-	int                         inputSampleRate;
 
 	obs_source_t                *source;
 	string                      device_id;
@@ -299,22 +299,25 @@ void WASAPISource::UpdateSettings(obs_data_t *settings)
 	useDeviceTiming = obs_data_get_bool(settings, OPT_USE_DEVICE_TIMING);
 	isDefaultDevice = _strcmpi(device_id.c_str(), "default") == 0;
 	disableAEC = obs_data_get_bool(settings, OPT_DISABLE_AEC);
+	inFormatMode = (int)obs_data_get_int(settings, OPT_IN_FMT_MODE);
 	aecInputDelay = (int)obs_data_get_int(settings, OPT_AEC_IN_DELAY);
 	aecDumpFileDir = obs_data_get_string(settings, OPT_AEC_DUMP_DIR);
 
-	blog(LOG_INFO, "disable_aec: %d, input delay: %d, dump dir: %s",
-		disableAEC, aecInputDelay, aecDumpFileDir.c_str());
+	blog(LOG_INFO, "disable_aec: %d, input delay: %d, dump dir: %s, fmt_mode: %d",
+		disableAEC, aecInputDelay, aecDumpFileDir.c_str(), inFormatMode);
 }
 
 void WASAPISource::Update(obs_data_t *settings)
 {
 	string newDevice = obs_data_get_string(settings, OPT_DEVICE_ID);
 	bool newDisableAEC = obs_data_get_bool(settings, OPT_DISABLE_AEC);
+	int newInFormatMode = (int)obs_data_get_int(settings, OPT_IN_FMT_MODE);
 	int newInputDelay = (int)obs_data_get_int(settings, OPT_AEC_IN_DELAY);
 	string newDumpFileDir = obs_data_get_string(settings, OPT_AEC_DUMP_DIR);
 	bool restart = (
 		newDevice.compare(device_id) != 0 ||
 		newDisableAEC != disableAEC ||
+		newInFormatMode != inFormatMode ||
 		newInputDelay != aecInputDelay ||
 		newDumpFileDir.compare(aecDumpFileDir) != 0);
 
@@ -325,6 +328,29 @@ void WASAPISource::Update(obs_data_t *settings)
 
 	if (restart)
 		Start();
+}
+
+static inline HRESULT GetMixFormat(
+	ComPtr<IAudioClient> client, WAVEFORMATEX **ppFormat, const char* clientName)
+{
+	HRESULT res = client->GetMixFormat(ppFormat);
+	if (FAILED(res))
+		return res;
+	blog(LOG_INFO, "MixFormat (%s) ch: %d, bits: %d, sampleRate: %d, formatTag: %d",
+		clientName, (*ppFormat)->nChannels, (*ppFormat)->wBitsPerSample,
+		(*ppFormat)->nSamplesPerSec, (*ppFormat)->wFormatTag);
+
+	WAVEFORMATEX* closestFormat = nullptr;
+	res = client->IsFormatSupported(AUDCLNT_SHAREMODE_SHARED, *ppFormat, &closestFormat);
+	if (res != S_FALSE) // succeeded, or failed with no alternative
+		return res;
+
+	CoTaskMemFree(*ppFormat);
+	*ppFormat = closestFormat;
+	blog(LOG_INFO, "ClosestFormat (%s) ch: %d, bits: %d, sampleRate: %d, formatTag: %d",
+		clientName, closestFormat->nChannels, closestFormat->wBitsPerSample,
+		closestFormat->nSamplesPerSec, closestFormat->wFormatTag);
+	return S_OK;
 }
 
 bool WASAPISource::InitDevice(IMMDeviceEnumerator *enumerator)
@@ -357,37 +383,75 @@ bool WASAPISource::InitDevice(IMMDeviceEnumerator *enumerator)
 
 void WASAPISource::InitClient()
 {
-	CoTaskMemPtr<WAVEFORMATEX> wfex;
-	HRESULT                    res;
-	DWORD                      flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+	HRESULT res;
+	DWORD   flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+	int     pass = 0;
 
 	res = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
 			nullptr, (void**)client.Assign());
 	if (FAILED(res))
 		throw HRError("Failed to activate client context", res);
 
-	res = client->GetMixFormat(&wfex);
+	res = GetMixFormat(client, &wfexClient, "client");
 	if (FAILED(res))
 		throw HRError("Failed to get mix format", res);
-
-	InitFormat(wfex);
 
 	if (!isInputDevice)
 		flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
 
-	res = client->Initialize(
-			AUDCLNT_SHAREMODE_SHARED, flags,
-			BUFFER_TIME_100NS, 0, wfex, nullptr);
-	if (FAILED(res))
-		throw HRError("Failed to initialize audio client", res);
+	while (true) {
+		if (pass >= inFormatMode) {
+			InitFormat(wfexClient);
+
+			res = client->Initialize(
+				AUDCLNT_SHAREMODE_SHARED, flags,
+				BUFFER_TIME_100NS, 0, wfexClient, nullptr);
+
+			if (SUCCEEDED(res)) {
+				break;
+			}
+		}
+
+		pass ++;
+		switch (pass) {
+			case 1:
+				wfexClient->nChannels = 1;
+				wfexClient->wFormatTag = WAVE_FORMAT_PCM;
+				wfexClient->wBitsPerSample = 16;
+				wfexClient->cbSize = 0;
+				flags |= AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+				         AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+				break;
+			case 2:
+				if (isInputDevice && !disableAEC) {
+					wfexClient->nSamplesPerSec = 22050;
+				}
+				else {
+					wfexClient->nSamplesPerSec = 44100;
+				}
+				break;
+			case 3:
+				throw HRError("Failed to initialize audio client", res);
+		}
+		wfexClient->nBlockAlign = wfexClient->nChannels * (wfexClient->wBitsPerSample / 8);
+		wfexClient->nAvgBytesPerSec = wfexClient->nSamplesPerSec * wfexClient->nBlockAlign;
+
+		blog(LOG_INFO, "Re-initialize audio client on error (%lX), pass %d", res, pass);
+		client.Clear();
+		res = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
+			nullptr, (void**)client.Assign());
+		if (FAILED(res))
+			throw HRError("Failed to activate client context", res);
+	}
 }
 
 void WASAPISource::InitRender()
 {
-	CoTaskMemPtr<WAVEFORMATEX> wfex;
-	HRESULT                    res;
-	LPBYTE                     buffer;
-	UINT32                     frames;
+	HRESULT res;
+	DWORD   flags = 0;
+	LPBYTE  buffer;
+	UINT32  frames;
+	int     pass = 0;
 
 	if (isInputDevice) {
 		if (!deviceRender.Get())
@@ -403,23 +467,61 @@ void WASAPISource::InitRender()
 	if (FAILED(res))
 		throw HRError("Failed to activate client context", res);
 
-	res = clientRender->GetMixFormat(&wfex);
+	res = GetMixFormat(clientRender, &wfexClientRender, "clientRender");
 	if (FAILED(res))
 		throw HRError("Failed to get mix format", res);
 
-	if (isInputDevice) {
-		res = clientRender->Initialize(
-				AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-				BUFFER_TIME_100NS, 0, wfex, nullptr);
-	}
-	else {
-		res = clientRender->Initialize(
-				AUDCLNT_SHAREMODE_SHARED, 0,
-				BUFFER_TIME_100NS, 0, wfex, nullptr);
-	}
+	if (isInputDevice)
+		flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
 
-	if (FAILED(res))
-		throw HRError("Failed to initialize audio client", res);
+	while (true) {
+		if (pass >= inFormatMode) {
+			res = clientRender->Initialize(
+				AUDCLNT_SHAREMODE_SHARED, flags,
+				BUFFER_TIME_100NS, 0, wfexClientRender, nullptr);
+
+			if (SUCCEEDED(res)) {
+				break;
+			}
+		}
+
+		pass ++;
+		switch (pass) {
+			case 1:
+				wfexClientRender->nChannels = 1;
+				wfexClientRender->wFormatTag = WAVE_FORMAT_PCM;
+				wfexClientRender->wBitsPerSample = 16;
+				wfexClientRender->cbSize = 0;
+				flags |= AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+				         AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+				break;
+			case 2:
+				if (isInputDevice) {
+					wfexClientRender->nSamplesPerSec = 22050;
+				}
+				else {
+					wfexClientRender->nSamplesPerSec = 44100;
+				}
+				break;
+			case 3:
+				throw HRError("Failed to initialize audio client", res);
+		}
+		wfexClientRender->nBlockAlign = wfexClientRender->nChannels * (wfexClientRender->wBitsPerSample / 8);
+		wfexClientRender->nAvgBytesPerSec = wfexClientRender->nSamplesPerSec * wfexClientRender->nBlockAlign;
+
+		blog(LOG_INFO, "Re-initialize audio render client on error (%lX), pass %d", res, pass);
+		clientRender.Clear();
+		if (isInputDevice) {
+			res = deviceRender->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
+				nullptr, (void**)clientRender.Assign());
+		}
+		else {
+			res = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL,
+				nullptr, (void**)clientRender.Assign());
+		}
+		if (FAILED(res))
+			throw HRError("Failed to activate client context", res);
+	}
 
 	if (isInputDevice)
 		return;
@@ -441,7 +543,7 @@ void WASAPISource::InitRender()
 	if (FAILED(res))
 		throw HRError("Failed to get buffer", res);
 
-	memset(buffer, 0, frames*wfex->nBlockAlign);
+	memset(buffer, 0, frames*wfexClientRender->nBlockAlign);
 
 	render->ReleaseBuffer(frames, 0);
 }
@@ -472,6 +574,11 @@ void WASAPISource::InitFormat(WAVEFORMATEX *wfex)
 	sampleRate = wfex->nSamplesPerSec;
 	format     = AUDIO_FORMAT_FLOAT;
 	speakers   = ConvertSpeakerLayout(layout, wfex->nChannels);
+
+	if (wfex->wFormatTag == WAVE_FORMAT_PCM) {
+		assert(wfex->wBitsPerSample == 16);
+		format = AUDIO_FORMAT_16BIT;
+	}
 
 	blog(LOG_INFO, "##### Device Type: %s, channels: %d, bitspersample: %d, samplerate: %d",
 		isInputDevice ? "input": "output",
@@ -551,6 +658,10 @@ void WASAPISource::InitCapture()
 
 			DMO_MEDIA_TYPE mt;
 
+			CoTaskMemPtr<WAVEFORMATEX> wfex;
+			*(&wfex) = (WAVEFORMATEX*)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
+			assert(wfex); // it should never run out of memory
+
 			mt.majortype = MEDIATYPE_Audio;
 			mt.subtype = MEDIASUBTYPE_PCM;
 			mt.lSampleSize = 0;
@@ -558,64 +669,31 @@ void WASAPISource::InitCapture()
 			mt.bTemporalCompression = FALSE;
 			mt.formattype = FORMAT_WaveFormatEx;
 			mt.cbFormat = sizeof(WAVEFORMATEX);
-
-			CoTaskMemPtr<WAVEFORMATEX> wfex;
-
-			res = client->GetMixFormat(&wfex);
-			if (FAILED(res))
-				throw HRError("Failed to get mix format 0", res);
-			blog(LOG_INFO, "##### Input WAVEFORMATEX: "
-				"tag %d, channels %d, sample rate %d, bytes rate %d, block %d, bits %d",
-				wfex->wFormatTag, wfex->nChannels, wfex->nSamplesPerSec,
-				wfex->nAvgBytesPerSec, wfex->nBlockAlign, wfex->wBitsPerSample);
-			nChannels = wfex->nChannels;
-			inputSampleRate = wfex->nSamplesPerSec;
 			mt.pbFormat = (BYTE*)(WAVEFORMATEX*)wfex;
+
 			wfex->wFormatTag = WAVE_FORMAT_PCM;
+			wfex->nSamplesPerSec = wfexClient->nSamplesPerSec;
+			wfex->nAvgBytesPerSec = wfexClient->nSamplesPerSec * 2;
 			wfex->nChannels = 1;
-			wfex->nAvgBytesPerSec = inputSampleRate * 2;
 			wfex->nBlockAlign = 2;
 			wfex->wBitsPerSample = 16;
 			wfex->cbSize = 0;
+
 			res = captureDMO->SetInputType(0, &mt, 0);
 			if (FAILED(res))
 				throw HRError("Failed to set input type 0", res);
 
-			res = clientRender->GetMixFormat(&wfex);
-			if (FAILED(res))
-				throw HRError("Failed to get mix format 1", res);
-			blog(LOG_INFO, "##### Loopback WAVEFORMATEX: "
-				"tag %d, channels %d, sample rate %d, bytes rate %d, block %d, bits %d",
-				wfex->wFormatTag, wfex->nChannels, wfex->nSamplesPerSec,
-				wfex->nAvgBytesPerSec, wfex->nBlockAlign, wfex->wBitsPerSample);
-			nChannelsRender = wfex->nChannels;
-			mt.pbFormat = (BYTE*)(WAVEFORMATEX*)wfex;
-			wfex->wFormatTag = WAVE_FORMAT_PCM;
-			wfex->nChannels = 1;
-			wfex->nAvgBytesPerSec = wfex->nSamplesPerSec * 2;
-			wfex->nBlockAlign = 2;
-			wfex->wBitsPerSample = 16;
-			wfex->cbSize = 0;
+			wfex->nSamplesPerSec = wfexClientRender->nSamplesPerSec;
+			wfex->nAvgBytesPerSec = wfexClientRender->nSamplesPerSec * 2;
+
 			res = captureDMO->SetInputType(1, &mt, 0);
 			if (FAILED(res))
 				throw HRError("Failed to set input type 1", res);
 
-			res = MoInitMediaType(&mt, sizeof(WAVEFORMATEX));
-			if (FAILED(res))
-				throw HRError("Failed to init dmo media type", res);
-
-			WAVEFORMATEX* pwav = (WAVEFORMATEX*)mt.pbFormat;
-			pwav->wFormatTag = WAVE_FORMAT_PCM;
-			pwav->nChannels = 1;
-			pwav->nSamplesPerSec = 22050;
-			pwav->nAvgBytesPerSec = 22050 * 2;
-			pwav->nBlockAlign = 2;
-			pwav->wBitsPerSample = 16;
-			pwav->cbSize = 0;
+			wfex->nSamplesPerSec = 22050;
+			wfex->nAvgBytesPerSec = 22050 * 2;
 
 			res = captureDMO->SetOutputType(0, &mt, 0);
-			MoFreeMediaType(&mt);
-
 			if (FAILED(res))
 				throw HRError("Failed to set dmo output type", res);
 
@@ -670,6 +748,8 @@ void WASAPISource::Initialize()
 	render.Clear();
 	captureDMO.Clear();
 	captureDMOBuffer.Clear();
+	*(&wfexClient) = nullptr;
+	*(&wfexClientRender) = nullptr;
 
 	res = CoCreateInstance(__uuidof(MMDeviceEnumerator),
 			nullptr, CLSCTX_ALL,
@@ -684,7 +764,20 @@ void WASAPISource::Initialize()
 	device_name = GetDeviceName(device);
 
 	InitClient();
-	InitRender();
+
+	try {
+		InitRender();
+	}
+	catch (HRError error) {
+		if (isInputDevice) {
+			clientRender.Clear();
+			blog(LOG_WARNING, "Ignored loopback init error - %s: %lX", error.str, error.hr);
+		}
+		else {
+			throw error;
+		}
+	}
+
 	InitCapture();
 }
 
@@ -808,11 +901,16 @@ bool WASAPISource::ProcessCaptureData(bool& dmoActive, deque<ComPtr<IMediaBuffer
 			if (SUCCEEDED(CMediaBuffer::Create(frames * 2, ts, inMediaBuffer.Assign()))) {
 				inMediaBuffer->SetLength(frames * 2);
 				inMediaBuffer->GetBufferAndLength(&pData, NULL);
-				for (UINT32 i = 0; i < frames; i++) {
-					float f = ((float*)buffer)[i * nChannels];
-					((short*)pData)[i] = (short)(((f > 1.0f) ? 1.0f : (f < -1.0f) ? -1.0f : f) * 0x7fff);
+				if (wfexClient->wFormatTag == WAVE_FORMAT_PCM) {
+					memcpy(pData, buffer, frames * 2);
 				}
-
+				else {
+					int nChannels = wfexClient->nChannels;
+					for (UINT32 i = 0; i < frames; i++) {
+						float f = ((float*)buffer)[i * nChannels];
+						((short*)pData)[i] = (short)(((f > 1.0f)? 1.0f : (f < -1.0f)? -1.0f : f) * 0x7fff);
+					}
+				}
 				inputQueue.push_back(inMediaBuffer);
 			}
 			else {
@@ -830,9 +928,15 @@ bool WASAPISource::ProcessCaptureData(bool& dmoActive, deque<ComPtr<IMediaBuffer
 				if (outframes && SUCCEEDED(CMediaBuffer::Create(outframes * 2, 0, outMediaBuffer.Assign()))) {
 					outMediaBuffer->SetLength(outframes * 2);
 					outMediaBuffer->GetBufferAndLength(&pData, NULL);
-					for (UINT32 i = 0; i < outframes; i++) {
-						float f = ((float*)outbuffer)[i * nChannelsRender];
-						((short*)pData)[i] = (short)(((f > 1.0f) ? 1.0f : (f < -1.0f) ? -1.0f : f) * 0x7fff);
+					if (wfexClientRender->wFormatTag == WAVE_FORMAT_PCM) {
+						memcpy(pData, outbuffer, outframes * 2);
+					}
+					else {
+						int nChannels = wfexClientRender->nChannels;
+						for (UINT32 i = 0; i < outframes; i++) {
+							float f = ((float*)outbuffer)[i * nChannels];
+							((short*)pData)[i] = (short)(((f > 1.0f)? 1.0f : (f < -1.0f)? -1.0f : f) * 0x7fff);
+						}
 					}
 				}
 				else {
@@ -918,7 +1022,7 @@ bool WASAPISource::ProcessCaptureData(bool& dmoActive, deque<ComPtr<IMediaBuffer
 						data.data[0] = (const uint8_t*)pData;
 						data.frames = len / 2;
 						data.speakers = SPEAKERS_MONO;
-						data.samples_per_sec = inputSampleRate;
+						data.samples_per_sec = wfexClient->nSamplesPerSec;
 						data.format = AUDIO_FORMAT_16BIT;
 						data.timestamp = os_gettime_ns() -
 							(uint64_t)data.frames * 1000000000ULL /
@@ -1035,6 +1139,7 @@ static void GetWASAPIDefaultsInput(obs_data_t *settings)
 	obs_data_set_default_string(settings, OPT_DEVICE_ID, "default");
 	obs_data_set_default_bool(settings, OPT_USE_DEVICE_TIMING, false);
 	obs_data_set_default_bool(settings, OPT_DISABLE_AEC, false);
+	obs_data_set_default_int(settings, OPT_IN_FMT_MODE, 0);
 	obs_data_set_default_int(settings, OPT_AEC_IN_DELAY, 2);
 	obs_data_set_default_string(settings, OPT_AEC_DUMP_DIR, "");
 }
@@ -1044,6 +1149,7 @@ static void GetWASAPIDefaultsOutput(obs_data_t *settings)
 	obs_data_set_default_string(settings, OPT_DEVICE_ID, "default");
 	obs_data_set_default_bool(settings, OPT_USE_DEVICE_TIMING, true);
 	obs_data_set_default_bool(settings, OPT_DISABLE_AEC, false);
+	obs_data_set_default_int(settings, OPT_IN_FMT_MODE, 0);
 	obs_data_set_default_int(settings, OPT_AEC_IN_DELAY, 2);
 	obs_data_set_default_string(settings, OPT_AEC_DUMP_DIR, "");
 }
@@ -1106,6 +1212,8 @@ static obs_properties_t *GetWASAPIProperties(bool input)
 
 	obs_properties_add_bool(props,
 		OPT_DISABLE_AEC, "Disable Echo Cancellation");
+	obs_properties_add_int(props,
+		OPT_IN_FMT_MODE, "Audio Input Format Mode", 0, 3, 1);
 	obs_properties_add_int(props,
 		OPT_AEC_IN_DELAY, "AEC Input Delay", 0, 9, 1);
 	obs_properties_add_path(props,
